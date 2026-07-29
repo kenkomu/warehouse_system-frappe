@@ -193,3 +193,54 @@ class TestStockEntry(WarehouseTestCase):
 
 		self.assertEqual(get_stock_balance(self.item, self.wh_a), 10)
 		self.assertEqual(get_stock_balance(self.item, self.wh_b), 0)
+
+	def test_cannot_cancel_receipt_whose_stock_was_consumed(self):
+		entry = receipt(self.item, self.wh_a, qty=10, rate=100, posting_date="2026-01-01")
+		consume(self.item, self.wh_a, qty=8, posting_date="2026-06-01")
+
+		# Removing the receipt would leave the June consumption overdrawn.
+		with self.assertRaises(frappe.ValidationError):
+			entry.cancel()
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_a), 2)
+
+	def test_can_cancel_receipt_whose_stock_is_untouched(self):
+		entry = receipt(self.item, self.wh_a, qty=10, rate=100, posting_date="2026-01-01")
+		entry.cancel()
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_a), 0)
+
+	# --- backdating -----------------------------------------------------
+
+	def test_backdated_consume_cannot_overdraw_a_later_entry(self):
+		receipt(self.item, self.wh_a, qty=10, rate=100, posting_date="2026-01-01")
+		consume(self.item, self.wh_a, qty=10, posting_date="2026-06-01")
+
+		# There were 10 on hand in March, but June already spends all of them.
+		with self.assertRaises(frappe.ValidationError):
+			consume(self.item, self.wh_a, qty=10, posting_date="2026-03-01")
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_a), 0)
+
+	def test_backdated_consume_is_allowed_when_stock_covers_it(self):
+		receipt(self.item, self.wh_a, qty=10, rate=100, posting_date="2026-01-01")
+		consume(self.item, self.wh_a, qty=4, posting_date="2026-06-01")
+
+		consume(self.item, self.wh_a, qty=6, posting_date="2026-03-01")
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_a), 0)
+
+	def test_backdated_receipt_is_allowed(self):
+		receipt(self.item, self.wh_a, qty=5, rate=100, posting_date="2026-06-01")
+		receipt(self.item, self.wh_a, qty=7, rate=100, posting_date="2026-01-01")
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_a), 12)
+
+	def test_backdated_transfer_cannot_overdraw_the_source(self):
+		receipt(self.item, self.wh_a, qty=10, rate=100, posting_date="2026-01-01")
+		consume(self.item, self.wh_a, qty=10, posting_date="2026-06-01")
+
+		with self.assertRaises(frappe.ValidationError):
+			transfer(self.item, self.wh_a, self.wh_b, qty=10, posting_date="2026-03-01")
+
+		self.assertEqual(get_stock_balance(self.item, self.wh_b), 0)

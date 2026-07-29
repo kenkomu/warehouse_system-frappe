@@ -4,7 +4,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import flt, now_datetime
+from frappe.utils import flt, get_datetime, now_datetime
 
 
 class StockLedgerEntry(Document):
@@ -88,6 +88,68 @@ def get_moving_average_rate(item: str, warehouse: str, upto: str | None = None) 
 	)
 
 	return flt(row[0].valuation_rate) if row else 0.0
+
+
+def get_first_negative_balance(
+	item: str,
+	warehouse: str,
+	extra_rows: list[dict] | None = None,
+	exclude_voucher: tuple[str, str] | None = None,
+) -> dict | None:
+	"""First point in time where an item/warehouse runs a negative balance.
+
+	Returns the offending posting datetime and balance, or None if the timeline
+	is sound throughout.
+
+	A balance taken at a single moment cannot catch this: backdating an issue, or
+	cancelling a receipt that has since been drawn down, leaves *later* entries
+	overdrawn while every individual entry still looked valid when it was posted.
+	Walking the whole timeline is what closes that gap.
+
+	`extra_rows` folds in movements that are not in the ledger yet and
+	`exclude_voucher` drops one voucher's rows, so a caller can test the shape of
+	a change before committing to it.
+	"""
+	values = {"item": item, "warehouse": warehouse}
+	exclude_clause = ""
+	if exclude_voucher:
+		exclude_clause = "AND NOT (voucher_type = %(voucher_type)s AND voucher_no = %(voucher_no)s)"
+		values["voucher_type"], values["voucher_no"] = exclude_voucher
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT posting_datetime, actual_qty
+		FROM `tabStock Ledger Entry`
+		WHERE item = %(item)s
+			AND warehouse = %(warehouse)s
+			AND is_cancelled = 0
+			{exclude_clause}
+		ORDER BY posting_datetime ASC, creation ASC
+		""",
+		values,
+		as_dict=True,
+	)
+
+	timeline = [
+		{"posting_datetime": get_datetime(row.posting_datetime), "actual_qty": flt(row.actual_qty)}
+		for row in rows
+	]
+	timeline += [
+		{"posting_datetime": get_datetime(row["posting_datetime"]), "actual_qty": flt(row["actual_qty"])}
+		for row in extra_rows or []
+	]
+
+	# Stable, so rows already in the ledger keep their place against pending rows
+	# posted at the same instant.
+	timeline.sort(key=lambda row: row["posting_datetime"])
+
+	balance = 0.0
+	for row in timeline:
+		balance += row["actual_qty"]
+		if balance < 0:
+			return {"posting_datetime": row["posting_datetime"], "balance": balance}
+
+	return None
 
 
 def get_stock_value(item: str, warehouse: str, upto: str | None = None) -> float:
