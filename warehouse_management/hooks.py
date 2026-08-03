@@ -11,15 +11,13 @@ app_license = "mit"
 # required_apps = []
 
 # Each item in the list will be shown as an app in the apps page
-# add_to_apps_screen = [
-# 	{
-# 		"name": "warehouse_management",
-# 		"logo": "/assets/warehouse_management/logo.png",
-# 		"title": "Warehouse Management",
-# 		"route": "/warehouse_management",
-# 		"has_permission": "warehouse_management.api.permission.has_app_permission"
-# 	}
-# ]
+add_to_apps_screen = [
+	{
+		"name": "warehouse_management",
+		"title": "Warehouse Management",
+		"route": "/app/warehouse-management",
+	}
+]
 
 # Includes in <head>
 # ------------------

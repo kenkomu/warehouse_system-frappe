@@ -3,6 +3,8 @@
 Warehouse management system for X Electronics — a self-contained Frappe app for
 tracking stock across a warehouse tree, built without ERPNext.
 
+![Warehouse Management workspace](docs/screenshots/workspace.png)
+
 ### The design in one idea
 
 **The ledger is stateless.** There is no `Bin` table, no stored balance, no
@@ -28,6 +30,19 @@ ledger that is written far less often than it is reported on.
 | **Stock Entry** | Submittable voucher. Purpose: Receipt, Consume, or Transfer. |
 | **Stock Entry Detail** | Child table: item, qty, rate, source/target warehouse. |
 | **Stock Ledger Entry** | Append-only. Signed `actual_qty`, `incoming_rate`, `is_cancelled`, voucher backlink. |
+
+![Item list](docs/screenshots/item-list.png)
+
+Warehouses are a genuine tree — group nodes (cities, regions) organise the
+stock-holding leaves beneath them:
+
+![Warehouse tree view](docs/screenshots/warehouse-tree.png)
+
+The ledger itself is the whole state of the system. Signed quantities, a
+posting datetime, and a backlink to the voucher that wrote each row — nothing
+else is stored:
+
+![Stock Ledger Entry list](docs/screenshots/stock-ledger-entry-list.png)
 
 ### Moving average valuation
 
@@ -58,6 +73,19 @@ Carrying the source valuation across is what makes a transfer value-neutral:
 moving stock between warehouses never creates or destroys value. Asserted
 directly in `test_transfer_carries_valuation_across` and system-wide in
 `test_transfer_is_value_neutral_when_consolidated`.
+
+A Receipt takes a rate and a target warehouse:
+
+![Stock Entry — Receipt](docs/screenshots/stock-entry-receipt.png)
+
+A Transfer takes both warehouses and no rate — the value is read from the
+source, not entered:
+
+![Stock Entry — Transfer](docs/screenshots/stock-entry-transfer.png)
+
+All three purposes, and a cancelled entry, in the list view:
+
+![Stock Entry list](docs/screenshots/stock-entry-list.png)
 
 ### Negative stock
 
@@ -91,12 +119,28 @@ trail survives. Every balance, valuation and report query filters on
 
 ### Reports
 
-- **Stock Ledger** — one row per movement, with running balance and running
-  valuation accumulated across the filtered window. Negative quantities render
-  red. Filters: date range, item, warehouse.
-- **Stock Balance** — quantity, valuation rate and value as on a date, in a
-  single grouped query. The `Consolidate Warehouses` filter collapses to one row
-  per item. Filters: as-on date, item, warehouse, consolidate.
+**Stock Ledger** — one row per movement, with running balance and running
+valuation accumulated across the filtered window. Negative quantities render
+red. Filters: date range, item, warehouse.
+
+![Stock Ledger report](docs/screenshots/report-stock-ledger.png)
+
+The TV rows are the moving average doing its work: 10 land on 02-06 at
+KES 85,000, then 5 more on 15-06 at KES 95,000, and the valuation rate becomes
+KES 88,333.33 — `(10 × 85,000 + 5 × 95,000) / 15`. The consumption on 01-07
+moves the balance but leaves the rate untouched, because only incoming rows
+enter the average.
+
+**Stock Balance** — quantity, valuation rate and value as on a date, in a
+single grouped query. Filters: as-on date, item, warehouse, consolidate.
+
+![Stock Balance report](docs/screenshots/report-stock-balance.png)
+
+`Consolidate Warehouses` collapses the same data to one row per item — note
+PB-ANKER-20K, stocked in both Nairobi and Mombasa at different rates, resolving
+to a single blended KES 2,556.25:
+
+![Stock Balance report, consolidated](docs/screenshots/report-stock-balance-consolidated.png)
 
 ### Installation
 
@@ -105,6 +149,9 @@ cd $PATH_TO_YOUR_BENCH
 bench get-app git@github.com:kenkomu/warehouse_system-frappe.git --branch main
 bench install-app warehouse_management
 ```
+
+The app installs its own workspace, sidebar and desk icon, so it appears on the
+desk landing screen and `/app/warehouse-management` is a real home page.
 
 > **Note:** the DocTypes grant permissions to `Stock Manager` and `Stock User`,
 > but the app does not yet create those roles. On a fresh install only
@@ -140,10 +187,17 @@ ways.
 Honest list of what is not done:
 
 - `disabled` on Item and Warehouse is schema-only — nothing enforces it.
-- `Stock Manager` / `Stock User` roles are not created on install, and there is
-  no Workspace, so the app has no desk landing page.
+- `Stock Manager` / `Stock User` roles are not created on install, so a fresh
+  install is usable only by System Manager.
 - `get_children` / `add_node` (tree view endpoints) and document amendment are
   untested.
+- The workspace, sidebar and desk icon are shipped as fixtures but have no
+  tests; they are verified only by the screenshots above.
+
+### Screenshots
+
+The figures shown are demo data, not fixtures — the app installs empty. All
+screenshots live in [`docs/screenshots/`](docs/screenshots).
 
 ### Contributing
 
