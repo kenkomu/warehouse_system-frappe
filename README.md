@@ -34,6 +34,9 @@ far more often than it gets written to.
 
 ![Item list](docs/screenshots/item-list.png)
 
+Valuation Method is the one field on Item worth pointing at. It decides how that
+item is costed, and the section below covers what each setting changes.
+
 Warehouses are a real tree, not a flat list with a parent field bolted on. Group
 nodes (cities, regions) organise the stock-holding leaves under them.
 
