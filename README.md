@@ -34,8 +34,8 @@ far more often than it gets written to.
 
 ![Item list](docs/screenshots/item-list.png)
 
-Valuation Method is the one field on Item worth pointing at. It decides how that
-item is costed, and the section below covers what each setting changes.
+Valuation Method is the field worth pointing at. The next section covers what
+each setting changes.
 
 Warehouses are a real tree, not a flat list with a parent field bolted on. Group
 nodes (cities, regions) organise the stock-holding leaves under them.
@@ -49,125 +49,54 @@ datetime, and a pointer to whatever wrote the row. Nothing else.
 
 ### Valuation methods
 
-Every item carries a `valuation_method`: **Moving Average** (the default), **FIFO**
-or **LIFO**. Quantity is never affected, only value. Pick it on the Item.
+Every item has a `valuation_method`: Moving Average by default, or FIFO or LIFO.
+The choice never changes the quantity on hand, only what it's worth.
 
-Moving Average follows the definition the brief links to: the rate is
-recalculated whenever stock is acquired, against the value already on hand.
+Take three movements in one warehouse: 10 @ 100, then 30 @ 200, then 20 out.
+Twenty units are left whichever one you pick.
+
+| Method | Rate | Value of the 20 left |
+|---|---|---|
+| Moving Average | 175 | 3,500 |
+| FIFO | 200 | 4,000 |
+| LIFO | 150 | 3,000 |
+
+Moving Average blends everything into one cost. FIFO issues the oldest stock
+first, so the newer, dearer units are what's left over. LIFO does the opposite.
+That's a thousand shillings of difference on identical stock, which is why the
+field locks once an item has ledger entries. Changing it wouldn't affect what
+happens next, it would restate figures you've already reported.
+
+Moving Average follows the definition the brief links to. The rate is worked out
+against the stock you're actually holding:
 
 ```
 rate = value of stock on hand / quantity on hand
 ```
 
-That is not the same as averaging every receipt ever posted. Buy 10 @ 100, sell
-all ten, then buy 10 @ 200, and the stock on hand is worth 200. Averaging all
-receipts would say 150, and would still be carrying the cost of stock that has
-gone.
+That isn't the same as averaging every receipt ever posted. Buy 10 @ 100, sell
+all ten, then buy 10 @ 200, and what you're holding is worth 200. Averaging all
+the receipts would say 150, still carrying the cost of stock that's gone. My
+first version did that, and `TestMatchesErpnextDefinition` now pins it down
+against the worked examples on the linked page.
 
-The field locks as soon as ledger entries exist, for the same reason Stock UOM
-does. Changing the method doesn't change what happens next, it restates every
-figure you have already reported, because value is replayed from the ledger at
-read time rather than stored.
+Transfers stay value-neutral under all three, because the receiving warehouse is
+charged whatever left the source. Under FIFO that's the cost of the layers the
+draw reached, which isn't the rate of what stayed behind, so the two questions
+need separate answers.
 
-#### What each one does
+It all lives in `warehouse_management/valuation.py`. `ValuationState` takes
+ledger rows in posting order, and its `qty`, `value` and `rate` are right after
+every row. The reports, transfer pricing and point-in-time helpers all drive
+that one class, so the three methods can't drift apart.
 
-Take three movements against one warehouse: **10 @ 100**, then **30 @ 200**, then
-**20 out**. Twenty units are left under all three methods. What they're worth
-depends entirely on which you picked.
-
-| Method | What it holds | Rate | Value of the 20 on hand |
-|---|---|---|---|
-| Moving Average | one blended cost for everything | 175 | **3,500** |
-| FIFO | the newest layers, oldest issued first | 200 | **4,000** |
-| LIFO | the oldest layers, newest issued first | 150 | **3,000** |
-
-Moving Average blends: `(10×100 + 30×200) / 40 = 175`, and every unit is worth
-that regardless of when it arrived. FIFO issues the 100s first, so what's left
-is 20 of the 200s. LIFO issues the 200s first, so 10 of the 100s survive
-alongside 10 of the 200s.
-
-A thousand shillings of difference on identical stock. That's the whole point of
-the setting, and it's why it can't be changed once entries exist.
-
-#### The effects, one by one
-
-**Value on hand changes, quantity never does.** All three agree there are 20
-units. `get_stock_balance` doesn't consult the method at all.
-
-**The cost of what leaves changes.** Moving Average issues everything at the
-average. FIFO issues at the oldest layer, LIFO at the newest. Issuing 10 from
-10 @ 100 plus 10 @ 200 costs 150/unit under Moving Average, 100 under FIFO and
-200 under LIFO. That's `get_outgoing_rate`, and it's a different question from
-"what is my remaining stock worth". Under FIFO and LIFO the stock that goes and
-the stock that stays are priced differently.
-
-**Transfers price differently but stay value-neutral under all three.** The
-receiving warehouse is charged whatever left the source, so moving stock never
-creates or destroys value:
-
-| Method | Rate onto the target | Source keeps | Target gets | Total |
-|---|---|---|---|---|
-| Moving Average | 175 | 3,500 | 3,500 | 7,000 |
-| FIFO | 150 | 4,000 | 3,000 | 7,000 |
-| LIFO | 200 | 3,000 | 4,000 | 7,000 |
-
-Under FIFO a transfer that spans two layers is priced at their blend, so 10 @ 100
-plus 10 @ 200 is 3,000 for 20 units, or 150. Rows within a single Stock Entry
-draw from the same layers in order, so two transfers of 10 take the 100 layer
-and then the 200 layer rather than both claiming the 100s.
-
-**Backdating is absorbed rather than repaired.** Every method is sequential, so
-inserting a row in the past changes everything after it. Under Moving Average a
-backdated receipt changes the average that later issues were charged at. Under
-FIFO and LIFO it lands at a position in the queue, so it changes which layer is
-issued next: receive 10 @ 200 in June, backdate 10 @ 100 to January, then issue
-10, and FIFO now sends the January layer, which didn't exist when the June
-receipt was posted.
-
-This is the stateless design paying for itself. ERPNext would have to walk
-forward and rewrite each affected row. Here nothing is stored, so nothing needs
-rewriting. The next read replays the ledger and the new row is simply part of
-it.
-
-**Consolidation sums warehouses rather than re-deriving across them.** Both the
-average and the layers belong to a warehouse, so value is worked out per
-warehouse and the consolidated figure is the sum. Deriving one figure from the
-incoming rows across warehouses would count the receiving side of a transfer as
-though it were a purchase, and the total would move even though nothing entered
-or left the business. `test_consolidated_transfer_is_value_neutral_across_mixed_rates`
-holds all three methods to that.
-
-**Reads cost more than one query, for every method.** The brief notes that
-moving average valuation is a single SQL query in practice, and in ERPNext it
-is, because ERPNext stores `valuation_rate` on every ledger row and reading it
-is reading a column. This ledger stores nothing, and all three methods are path
-dependent: the average depends on what was on hand when each receipt landed, and
-the layers depend on what has already been drawn. So valuation is a replay in
-every case.
-
-Quantities are still a single grouped query. Stock Balance uses one for the
-balance and the in/out columns, then replays the movements for value. Stock
-Ledger already walked the rows in order for its running balance, so valuation
-costs it nothing extra.
-
-That is the honest price of the stateless ledger. Storing the rate would buy the
-one-query read back and cost the thing statelessness is for: a backdated entry
-would once again mean rewriting every row after it.
-
-#### Where it lives
-
-`warehouse_management/valuation.py` holds `ValuationState`, which is the only
-implementation of valuation in the app. Feed it ledger rows in posting order and
-`qty`, `value` and `rate` are correct after every row. The reports, the transfer
-pricing and the point-in-time helpers all drive that same class, so the three
-methods can't drift apart between them.
-
-Outgoing rows never carry a rate, and that's enforced in two places rather than
-one. Stock Entry zeroes the rate on anything that isn't a Receipt, and Stock
-Ledger Entry zeroes `incoming_rate` on any negative row no matter what it was
-handed. Every method depends on `actual_qty > 0` being a reliable test for "this
-row has a cost", so it's guarded at the ledger boundary and not just in the
-controller.
+One consequence worth being straight about. The brief notes that moving average
+is a single SQL query in practice, and in ERPNext it is, because ERPNext stores
+the rate on every ledger row. This ledger stores nothing, and all three methods
+depend on what came before, so valuation is a replay in every case. Quantities
+are still one grouped query. That's the price of the stateless ledger, and it
+buys the thing the design is for: a backdated entry never means rewriting
+history.
 
 ### What each purpose writes
 
@@ -178,13 +107,8 @@ controller.
 | Transfer | a `−qty` row at the source, and a `+qty` row at the target carrying the cost of the stock that left |
 
 Carrying the source valuation across is what keeps a transfer value-neutral.
-Moving stock between warehouses shouldn't create or destroy value. What that
-cost is depends on the item's valuation method: the average under Moving
-Average, the layers the draw reaches under FIFO and LIFO. The neutrality holds
-either way. `test_transfer_carries_valuation_across` checks it directly,
-`test_transfer_is_value_neutral_when_consolidated` checks it across the whole
-system, and `test_transfer_is_value_neutral_under_every_method` checks all three
-methods agree that value is conserved.
+Moving stock between warehouses shouldn't create or destroy value, and the tests
+check that under all three methods.
 
 A Receipt needs a rate and a target warehouse:
 
@@ -246,17 +170,15 @@ and leaves the rate alone, because stock issued at the prevailing average
 doesn't disturb it.
 
 **Stock Balance** gives quantity, valuation rate and value as on a date.
-Quantities come from one grouped query; value is replayed from the movements,
-since no method reduces to an aggregate. Filters are as-on date, item, warehouse
-and consolidate.
+Quantities come from one grouped query, value from replaying the movements.
+Filters are as-on date, item, warehouse and consolidate.
 
 ![Stock Balance report](docs/screenshots/report-stock-balance.png)
 
 Ticking `Consolidate Warehouses` collapses it to one row per item. PB-ANKER-20K
-is the interesting one, since it's stocked in both Nairobi and Mombasa at
-different rates: 155 in Mombasa at KES 2,500 and 120 in Nairobi at KES 2,650,
-which is KES 705,500 over 275 units, so KES 2,565.45. The consolidated figure is
-the sum of what each warehouse holds, not an average taken across them.
+is the interesting one, held in both Nairobi and Mombasa at different rates. The
+consolidated figure sums what each warehouse holds rather than averaging across
+them, which is what keeps a transfer between the two from moving the total.
 
 ![Stock Balance report, consolidated](docs/screenshots/report-stock-balance-consolidated.png)
 
@@ -299,10 +221,9 @@ be covered and said reports could have unit tests too, so both are in there:
 | Warehouse | 6 |
 | Item | 5 |
 
-The valuation suite runs the same three movements under each method and asserts
-the three different answers, then repeats that through real Stock Entries, both
-reports, and transfers. `TestMatchesErpnextDefinition` replays the worked
-examples from the page the brief links to.
+The valuation suite runs the same movements under each method and asserts the
+three different answers, through the helpers, real Stock Entries and both
+reports.
 
 `WarehouseTestCase` overrides `tearDown` so each test rolls back on its own.
 Frappe's `IntegrationTestCase` registers its rollback through `addClassCleanup`,
