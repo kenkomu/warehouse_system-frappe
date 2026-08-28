@@ -6,6 +6,12 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import flt, get_datetime, now_datetime
 
+from warehouse_management.warehouse_management.valuation import (
+	MOVING_AVERAGE,
+	get_item_valuation_method,
+	replay,
+)
+
 
 class StockLedgerEntry(Document):
 	def validate(self):
@@ -152,11 +158,78 @@ def get_first_negative_balance(
 	return None
 
 
-def get_stock_value(item: str, warehouse: str, upto: str | None = None) -> float:
-	"""Balance qty valued at the moving average rate."""
-	return flt(get_stock_balance(item, warehouse, upto)) * flt(
-		get_moving_average_rate(item, warehouse, upto)
+def get_ledger_rows(item: str, warehouse: str, upto: str | None = None) -> list[dict]:
+	"""Live ledger rows for an item/warehouse in posting order.
+
+	FIFO and LIFO cannot be reduced to an aggregate the way a weighted average
+	can, because which units are still on hand decides what they are worth. They
+	need the movements themselves, replayed in order.
+	"""
+	values = {"item": item, "warehouse": warehouse}
+	upto_clause = ""
+	if upto:
+		upto_clause = "AND posting_datetime <= %(upto)s"
+		values["upto"] = upto
+
+	return frappe.db.sql(
+		f"""
+		SELECT actual_qty, incoming_rate
+		FROM `tabStock Ledger Entry`
+		WHERE item = %(item)s
+			AND warehouse = %(warehouse)s
+			AND is_cancelled = 0
+			{upto_clause}
+		ORDER BY posting_datetime ASC, creation ASC
+		""",
+		values,
+		as_dict=True,
 	)
+
+
+def get_valuation_rate(
+	item: str, warehouse: str, upto: str | None = None, method: str | None = None
+) -> float:
+	"""Cost per unit of the stock on hand, under the item's configured method.
+
+	Moving Average keeps its single-query path; the layered methods replay.
+	"""
+	method = method or get_item_valuation_method(item)
+
+	if method == MOVING_AVERAGE:
+		return get_moving_average_rate(item, warehouse, upto)
+
+	return flt(replay(get_ledger_rows(item, warehouse, upto), method).rate)
+
+
+def get_outgoing_rate(
+	item: str, warehouse: str, qty, upto: str | None = None, method: str | None = None
+) -> float:
+	"""Cost per unit of removing qty from a warehouse.
+
+	This is not the same question as `get_valuation_rate`. Under Moving Average
+	it is, because every unit leaves at the average. Under FIFO and LIFO the cost
+	of what leaves is decided by the layers the draw reaches, which is generally
+	not the rate of what stays behind.
+	"""
+	method = method or get_item_valuation_method(item)
+
+	if method == MOVING_AVERAGE:
+		return get_moving_average_rate(item, warehouse, upto)
+
+	state = replay(get_ledger_rows(item, warehouse, upto), method)
+	return flt(state.outgoing_rate(qty))
+
+
+def get_stock_value(item: str, warehouse: str, upto: str | None = None) -> float:
+	"""Value of the stock on hand, under the item's configured method."""
+	method = get_item_valuation_method(item)
+
+	if method == MOVING_AVERAGE:
+		return flt(get_stock_balance(item, warehouse, upto)) * flt(
+			get_moving_average_rate(item, warehouse, upto)
+		)
+
+	return flt(replay(get_ledger_rows(item, warehouse, upto), method).value)
 
 
 def make_sle(**kwargs) -> "StockLedgerEntry":

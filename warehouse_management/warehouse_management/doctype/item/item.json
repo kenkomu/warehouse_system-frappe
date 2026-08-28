@@ -11,6 +11,7 @@
   "item_name",
   "column_break_basic",
   "stock_uom",
+  "valuation_method",
   "disabled",
   "section_break_desc",
   "description"
@@ -43,6 +44,15 @@
    "in_list_view": 1,
    "label": "Stock UOM",
    "reqd": 1
+  },
+  {
+   "fieldname": "valuation_method",
+   "fieldtype": "Select",
+   "label": "Valuation Method",
+   "options": "Moving Average\nFIFO\nLIFO",
+   "default": "Moving Average",
+   "description": "How the cost of this item is worked out. Locked once stock ledger entries exist.",
+   "in_list_view": 1
   },
   {
    "default": "0",

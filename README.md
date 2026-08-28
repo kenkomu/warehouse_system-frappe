@@ -26,7 +26,7 @@ far more often than it gets written to.
 
 | DocType | Notes |
 |---|---|
-| Item | Named by `item_code`. Stock UOM locks once ledger entries exist. |
+| Item | Named by `item_code`. Carries the `valuation_method`. Stock UOM and valuation method both lock once ledger entries exist. |
 | Warehouse | Tree (`NestedSet`, lft/rgt). Group nodes can't hold stock, and you can't delete one that ledger entries still point at. |
 | Stock Entry | Submittable voucher. Purpose is Receipt, Consume or Transfer. |
 | Stock Entry Detail | Child table: item, qty, rate, source and target warehouse. |
@@ -44,22 +44,107 @@ datetime, and a pointer to whatever wrote the row. Nothing else.
 
 ![Stock Ledger Entry list](docs/screenshots/stock-ledger-entry-list.png)
 
-### Moving average valuation
+### Valuation methods
 
-The brief said this is one SQL query in practice, and it is. It's the weighted
-average cost of everything received up to a point in time:
+Every item carries a `valuation_method`: **Moving Average** (the default), **FIFO**
+or **LIFO**. Quantity is never affected, only value. Pick it on the Item.
+
+The field locks as soon as ledger entries exist, for the same reason Stock UOM
+does. Changing the method doesn't change what happens next, it restates every
+figure you have already reported, because value is replayed from the ledger at
+read time rather than stored.
+
+#### What each one does
+
+Take three movements against one warehouse: **10 @ 100**, then **30 @ 200**, then
+**20 out**. Twenty units are left under all three methods. What they're worth
+depends entirely on which you picked.
+
+| Method | What it holds | Rate | Value of the 20 on hand |
+|---|---|---|---|
+| Moving Average | one blended cost for everything | 175 | **3,500** |
+| FIFO | the newest layers, oldest issued first | 200 | **4,000** |
+| LIFO | the oldest layers, newest issued first | 150 | **3,000** |
+
+Moving Average blends: `(10×100 + 30×200) / 40 = 175`, and every unit is worth
+that regardless of when it arrived. FIFO issues the 100s first, so what's left
+is 20 of the 200s. LIFO issues the 200s first, so 10 of the 100s survive
+alongside 10 of the 200s.
+
+A thousand shillings of difference on identical stock. That's the whole point of
+the setting, and it's why it can't be changed once entries exist.
+
+#### The effects, one by one
+
+**Value on hand changes, quantity never does.** All three agree there are 20
+units. `get_stock_balance` doesn't consult the method at all.
+
+**The cost of what leaves changes.** Moving Average issues everything at the
+average. FIFO issues at the oldest layer, LIFO at the newest. Issuing 10 from
+10 @ 100 plus 10 @ 200 costs 150/unit under Moving Average, 100 under FIFO and
+200 under LIFO. That's `get_outgoing_rate`, and it's a different question from
+"what is my remaining stock worth" — under FIFO and LIFO the stock that goes and
+the stock that stays are priced differently.
+
+**Transfers price differently but stay value-neutral under all three.** The
+receiving warehouse is charged whatever left the source, so moving stock never
+creates or destroys value:
+
+| Method | Rate onto the target | Source keeps | Target gets | Total |
+|---|---|---|---|---|
+| Moving Average | 175 | 3,500 | 3,500 | 7,000 |
+| FIFO | 150 | 4,000 | 3,000 | 7,000 |
+| LIFO | 200 | 3,000 | 4,000 | 7,000 |
+
+Under FIFO a transfer that spans two layers is priced at their blend — 10 @ 100
+plus 10 @ 200 is 3,000 for 20 units, so 150. Rows within a single Stock Entry
+draw from the same layers in order, so two transfers of 10 take the 100 layer
+and then the 200 layer rather than both claiming the 100s.
+
+**Backdating behaves differently.** Under Moving Average a backdated receipt just
+joins the weighted average. Under FIFO and LIFO it lands at a *position* in the
+queue, so it changes which layer is issued next. Receive 10 @ 200 in June,
+backdate 10 @ 100 to January, then issue 10: FIFO now sends the January layer,
+which didn't exist when the June receipt was posted. Nothing had to be rewritten
+for that to work — the queue is rebuilt from the ledger on every read.
+
+**Consolidated valuation is more correct under FIFO and LIFO.** Consolidating
+sums each warehouse's real layers. Moving Average consolidation re-derives one
+average from the incoming rows across warehouses, which double-counts the
+incoming side of a transfer. With two warehouses holding the same item at
+different costs, a transfer between them shifts the consolidated Moving Average
+value even though nothing entered or left the business. FIFO and LIFO don't have
+this problem, and `test_consolidated_transfer_is_value_neutral_across_mixed_rates`
+pins it down. See the gaps section.
+
+**Reads cost more under FIFO and LIFO.** Moving Average is still one SQL query:
 
 ```
 rate = SUM(actual_qty * incoming_rate) / SUM(actual_qty)    over incoming rows only
 ```
 
-That's `get_moving_average_rate` in
-`warehouse_management/doctype/stock_ledger_entry/stock_ledger_entry.py`.
+FIFO and LIFO can't be reduced to an aggregate, because which units you're
+holding decides what they're worth. They replay the movements in order and
+maintain the layers still on hand. Stock Balance keeps the single grouped query
+for Moving Average items and adds a second pass only when a layered item is
+actually in the result, so the default path is unchanged. Stock Ledger already
+walked the rows in order for its running balance, so layered methods cost it
+nothing extra.
 
-Outgoing rows never carry a rate, and I enforce that in two places rather than
+#### Where it lives
+
+`warehouse_management/valuation.py` holds `ValuationState`, which is the only
+implementation of valuation in the app. Feed it ledger rows in posting order and
+`qty`, `value` and `rate` are correct after every row. The reports, the transfer
+pricing and the point-in-time helpers all drive that same class, so the three
+methods can't drift apart between them.
+
+Outgoing rows never carry a rate, and that's enforced in two places rather than
 one. Stock Entry zeroes the rate on anything that isn't a Receipt, and Stock
 Ledger Entry zeroes `incoming_rate` on any negative row no matter what it was
-handed. So consumption can't drag the valuation around. Only receipts move it.
+handed. Every method depends on `actual_qty > 0` being a reliable test for "this
+row has a cost", so it's guarded at the ledger boundary and not just in the
+controller.
 
 ### What each purpose writes
 
@@ -67,13 +152,16 @@ handed. So consumption can't drag the valuation around. Only receipts move it.
 |---|---|
 | Receipt | one `+qty` row at the rate you entered |
 | Consume | one `−qty` row at rate 0 |
-| Transfer | a `−qty` row at the source, and a `+qty` row at the target carrying the source's moving average |
+| Transfer | a `−qty` row at the source, and a `+qty` row at the target carrying the cost of the stock that left |
 
 Carrying the source valuation across is what keeps a transfer value-neutral.
-Moving stock between warehouses shouldn't create or destroy value, and
-`test_transfer_carries_valuation_across` checks it directly while
+Moving stock between warehouses shouldn't create or destroy value. What that
+cost is depends on the item's valuation method — the average under Moving
+Average, the layers the draw reaches under FIFO and LIFO — but the neutrality
+holds either way. `test_transfer_carries_valuation_across` checks it directly,
 `test_transfer_is_value_neutral_when_consolidated` checks it across the whole
-system.
+system, and `test_transfer_is_value_neutral_under_every_method` checks all three
+methods agree that value is conserved.
 
 A Receipt needs a rate and a target warehouse:
 
@@ -170,17 +258,22 @@ section below.
 bench --site $YOUR_SITE run-tests --app warehouse_management
 ```
 
-69 tests, about 7 seconds. The brief asked for all non-report functionality to
+96 tests, about 7 seconds. The brief asked for all non-report functionality to
 be covered and said reports could have unit tests too, so both are in there:
 
 | Suite | Tests |
 |---|---|
 | Stock Entry | 26 |
 | Stock Ledger Entry | 13 |
+| Valuation | 27 |
 | Stock Balance report | 10 |
 | Stock Ledger report | 9 |
 | Warehouse | 6 |
 | Item | 5 |
+
+The valuation suite runs the same three movements under each method and asserts
+the three different answers, then repeats that through real Stock Entries, both
+reports, and transfers.
 
 `WarehouseTestCase` overrides `tearDown` so each test rolls back on its own.
 Frappe's `IntegrationTestCase` registers its rollback through `addClassCleanup`,
@@ -190,6 +283,12 @@ depending on what order they ran in.
 
 ### Known gaps
 
+- Consolidated Stock Balance re-averages incoming rows for Moving Average items,
+  so a transfer between two warehouses holding the same item at different costs
+  shifts the consolidated value even though nothing entered or left. Per-warehouse
+  figures are unaffected, and FIFO and LIFO don't have the problem because they
+  sum real layers. Fixing it properly needs the ledger to mark transfer-generated
+  incoming rows, since right now the row can't tell itself apart from a receipt.
 - `disabled` on Item and Warehouse is in the schema but nothing acts on it.
 - The `Stock Manager` and `Stock User` roles aren't created on install, so a
   fresh install only works for System Manager.

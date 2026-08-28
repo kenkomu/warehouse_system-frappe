@@ -4,12 +4,19 @@
 """Stock Ledger: every stock movement, one row per ledger entry.
 
 The running balance and running valuation are accumulated over the returned
-rows rather than read from stored state, keeping the ledger stateless.
+rows rather than read from stored state, keeping the ledger stateless. The
+accumulation is a `ValuationState` per item/warehouse, so each row is valued
+under whichever method its item is configured for.
 """
 
 import frappe
 from frappe import _
 from frappe.utils import flt
+
+from warehouse_management.warehouse_management.valuation import (
+	ValuationState,
+	get_item_valuation_method,
+)
 
 
 def execute(filters=None):
@@ -124,20 +131,21 @@ def get_data(filters):
 	)
 
 	# Running balance/valuation per item+warehouse across the filtered window.
-	running = {}
+	# Layered methods need the movements in order, which is exactly what this
+	# report already walks, so FIFO and LIFO cost nothing extra here.
+	states = {}
+	methods = {}
+
 	for row in entries:
+		if row.item not in methods:
+			methods[row.item] = get_item_valuation_method(row.item)
+
 		key = (row.item, row.warehouse)
-		state = running.setdefault(key, {"qty": 0.0, "in_qty": 0.0, "in_value": 0.0})
+		state = states.setdefault(key, ValuationState(methods[row.item]))
+		state.add(row.actual_qty, row.incoming_rate)
 
-		state["qty"] += flt(row.actual_qty)
-		if flt(row.actual_qty) > 0:
-			state["in_qty"] += flt(row.actual_qty)
-			state["in_value"] += flt(row.actual_qty) * flt(row.incoming_rate)
-
-		valuation_rate = (state["in_value"] / state["in_qty"]) if state["in_qty"] else 0.0
-
-		row.balance_qty = state["qty"]
-		row.valuation_rate = valuation_rate
-		row.balance_value = state["qty"] * valuation_rate
+		row.balance_qty = flt(state.qty)
+		row.valuation_rate = flt(state.rate)
+		row.balance_value = flt(state.value)
 
 	return entries

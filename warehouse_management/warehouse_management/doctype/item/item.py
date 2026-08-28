@@ -5,18 +5,42 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+from warehouse_management.warehouse_management.valuation import DEFAULT_VALUATION_METHOD
+
 
 class Item(Document):
 	def validate(self):
 		if not self.item_name:
 			self.item_name = self.item_code
 
-		if flt_qty_exists(self.name) and self.has_value_changed("stock_uom"):
-			frappe.throw(
-				_("Cannot change Stock UOM for {0} because stock ledger entries already exist.").format(
-					self.name
+		if not self.valuation_method:
+			self.valuation_method = DEFAULT_VALUATION_METHOD
+
+		self.validate_locked_fields()
+
+	def validate_locked_fields(self):
+		"""Neither the stock unit nor the costing method may change under stock.
+
+		Both restate history rather than change the future. The ledger records
+		quantities in the stock UOM, and value is replayed under whichever method
+		is set at read time, so changing either silently rewrites figures that
+		have already been reported.
+		"""
+		if not flt_qty_exists(self.name):
+			return
+
+		locked = (
+			("stock_uom", _("Stock UOM")),
+			("valuation_method", _("Valuation Method")),
+		)
+
+		for fieldname, label in locked:
+			if self.has_value_changed(fieldname):
+				frappe.throw(
+					_("Cannot change {0} for {1} because stock ledger entries already exist.").format(
+						label, self.name
+					)
 				)
-			)
 
 
 def flt_qty_exists(item: str) -> bool:

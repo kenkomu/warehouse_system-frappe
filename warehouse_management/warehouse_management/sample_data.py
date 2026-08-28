@@ -7,7 +7,12 @@ import frappe
 from frappe.utils import nowtime, today
 
 
-def create_item(item_code: str, item_name: str | None = None, stock_uom: str = "Nos") -> str:
+def create_item(
+	item_code: str,
+	item_name: str | None = None,
+	stock_uom: str = "Nos",
+	valuation_method: str | None = None,
+) -> str:
 	if frappe.db.exists("Item", item_code):
 		return item_code
 
@@ -17,6 +22,7 @@ def create_item(item_code: str, item_name: str | None = None, stock_uom: str = "
 			"item_code": item_code,
 			"item_name": item_name or item_code,
 			"stock_uom": stock_uom,
+			"valuation_method": valuation_method,
 		}
 	)
 	doc.insert(ignore_permissions=True)

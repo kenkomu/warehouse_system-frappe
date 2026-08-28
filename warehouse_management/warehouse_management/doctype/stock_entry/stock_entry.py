@@ -9,9 +9,13 @@ from frappe.utils import flt, format_datetime, get_datetime, getdate
 from warehouse_management.warehouse_management.doctype.stock_ledger_entry.stock_ledger_entry import (
 	cancel_sles,
 	get_first_negative_balance,
-	get_moving_average_rate,
+	get_ledger_rows,
 	get_stock_balance,
 	make_sle,
+)
+from warehouse_management.warehouse_management.valuation import (
+	get_item_valuation_method,
+	replay,
 )
 
 RECEIPT = "Receipt"
@@ -170,13 +174,19 @@ class StockEntry(Document):
 
 		Receipt  -> one incoming row
 		Consume  -> one outgoing row
-		Transfer -> an outgoing row and an incoming row carrying the source's
-		            moving average rate, so value follows the stock.
+		Transfer -> an outgoing row and an incoming row carrying the cost of the
+		            stock that left, so value follows the stock.
 
 		Kept separate from writing so the same rows can be validated first.
 		"""
 		posting_datetime = self.posting_datetime
 		planned = []
+
+		# Two rows moving the same item out of the same warehouse draw from the
+		# same cost layers, so the valuation is threaded across rows rather than
+		# recomputed against the untouched ledger each time. Under Moving Average
+		# this makes no difference; under FIFO and LIFO it decides the rate.
+		source_states = {}
 
 		for row in self.items:
 			if row.source_warehouse:
@@ -195,9 +205,11 @@ class StockEntry(Document):
 				if self.purpose == TRANSFER:
 					# Carry the source valuation across so a transfer never creates
 					# or destroys value.
-					incoming_rate = get_moving_average_rate(
-						row.item, row.source_warehouse, posting_datetime
+					state = self.source_valuation_state(
+						source_states, row.item, row.source_warehouse, posting_datetime
 					)
+					incoming_rate = flt(state.outgoing_rate(row.qty))
+					state.add(-flt(row.qty))
 				else:
 					incoming_rate = flt(row.rate)
 
@@ -213,6 +225,16 @@ class StockEntry(Document):
 				)
 
 		return planned
+
+	def source_valuation_state(self, cache: dict, item: str, warehouse: str, upto):
+		"""Replayed valuation for a source warehouse, built once per entry."""
+		key = (item, warehouse)
+		if key not in cache:
+			cache[key] = replay(
+				get_ledger_rows(item, warehouse, upto), get_item_valuation_method(item)
+			)
+
+		return cache[key]
 
 	def make_stock_ledger_entries(self):
 		"""Write the planned ledger rows."""
