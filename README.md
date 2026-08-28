@@ -49,6 +49,18 @@ datetime, and a pointer to whatever wrote the row. Nothing else.
 Every item carries a `valuation_method`: **Moving Average** (the default), **FIFO**
 or **LIFO**. Quantity is never affected, only value. Pick it on the Item.
 
+Moving Average follows the definition the brief links to: the rate is
+recalculated whenever stock is acquired, against the value already on hand.
+
+```
+rate = value of stock on hand / quantity on hand
+```
+
+That is not the same as averaging every receipt ever posted. Buy 10 @ 100, sell
+all ten, then buy 10 @ 200, and the stock on hand is worth 200. Averaging all
+receipts would say 150, and would still be carrying the cost of stock that has
+gone.
+
 The field locks as soon as ledger entries exist, for the same reason Stock UOM
 does. Changing the method doesn't change what happens next, it restates every
 figure you have already reported, because value is replayed from the ledger at
@@ -83,7 +95,7 @@ units. `get_stock_balance` doesn't consult the method at all.
 average. FIFO issues at the oldest layer, LIFO at the newest. Issuing 10 from
 10 @ 100 plus 10 @ 200 costs 150/unit under Moving Average, 100 under FIFO and
 200 under LIFO. That's `get_outgoing_rate`, and it's a different question from
-"what is my remaining stock worth" — under FIFO and LIFO the stock that goes and
+"what is my remaining stock worth". Under FIFO and LIFO the stock that goes and
 the stock that stays are priced differently.
 
 **Transfers price differently but stay value-neutral under all three.** The
@@ -96,40 +108,48 @@ creates or destroys value:
 | FIFO | 150 | 4,000 | 3,000 | 7,000 |
 | LIFO | 200 | 3,000 | 4,000 | 7,000 |
 
-Under FIFO a transfer that spans two layers is priced at their blend — 10 @ 100
-plus 10 @ 200 is 3,000 for 20 units, so 150. Rows within a single Stock Entry
+Under FIFO a transfer that spans two layers is priced at their blend, so 10 @ 100
+plus 10 @ 200 is 3,000 for 20 units, or 150. Rows within a single Stock Entry
 draw from the same layers in order, so two transfers of 10 take the 100 layer
 and then the 200 layer rather than both claiming the 100s.
 
-**Backdating behaves differently.** Under Moving Average a backdated receipt just
-joins the weighted average. Under FIFO and LIFO it lands at a *position* in the
-queue, so it changes which layer is issued next. Receive 10 @ 200 in June,
-backdate 10 @ 100 to January, then issue 10: FIFO now sends the January layer,
-which didn't exist when the June receipt was posted. Nothing had to be rewritten
-for that to work — the queue is rebuilt from the ledger on every read.
+**Backdating is absorbed rather than repaired.** Every method is sequential, so
+inserting a row in the past changes everything after it. Under Moving Average a
+backdated receipt changes the average that later issues were charged at. Under
+FIFO and LIFO it lands at a position in the queue, so it changes which layer is
+issued next: receive 10 @ 200 in June, backdate 10 @ 100 to January, then issue
+10, and FIFO now sends the January layer, which didn't exist when the June
+receipt was posted.
 
-**Consolidated valuation is more correct under FIFO and LIFO.** Consolidating
-sums each warehouse's real layers. Moving Average consolidation re-derives one
-average from the incoming rows across warehouses, which double-counts the
-incoming side of a transfer. With two warehouses holding the same item at
-different costs, a transfer between them shifts the consolidated Moving Average
-value even though nothing entered or left the business. FIFO and LIFO don't have
-this problem, and `test_consolidated_transfer_is_value_neutral_across_mixed_rates`
-pins it down. See the gaps section.
+This is the stateless design paying for itself. ERPNext would have to walk
+forward and rewrite each affected row. Here nothing is stored, so nothing needs
+rewriting. The next read replays the ledger and the new row is simply part of
+it.
 
-**Reads cost more under FIFO and LIFO.** Moving Average is still one SQL query:
+**Consolidation sums warehouses rather than re-deriving across them.** Both the
+average and the layers belong to a warehouse, so value is worked out per
+warehouse and the consolidated figure is the sum. Deriving one figure from the
+incoming rows across warehouses would count the receiving side of a transfer as
+though it were a purchase, and the total would move even though nothing entered
+or left the business. `test_consolidated_transfer_is_value_neutral_across_mixed_rates`
+holds all three methods to that.
 
-```
-rate = SUM(actual_qty * incoming_rate) / SUM(actual_qty)    over incoming rows only
-```
+**Reads cost more than one query, for every method.** The brief notes that
+moving average valuation is a single SQL query in practice, and in ERPNext it
+is, because ERPNext stores `valuation_rate` on every ledger row and reading it
+is reading a column. This ledger stores nothing, and all three methods are path
+dependent: the average depends on what was on hand when each receipt landed, and
+the layers depend on what has already been drawn. So valuation is a replay in
+every case.
 
-FIFO and LIFO can't be reduced to an aggregate, because which units you're
-holding decides what they're worth. They replay the movements in order and
-maintain the layers still on hand. Stock Balance keeps the single grouped query
-for Moving Average items and adds a second pass only when a layered item is
-actually in the result, so the default path is unchanged. Stock Ledger already
-walked the rows in order for its running balance, so layered methods cost it
-nothing extra.
+Quantities are still a single grouped query. Stock Balance uses one for the
+balance and the in/out columns, then replays the movements for value. Stock
+Ledger already walked the rows in order for its running balance, so valuation
+costs it nothing extra.
+
+That is the honest price of the stateless ledger. Storing the rate would buy the
+one-query read back and cost the thing statelessness is for: a backdated entry
+would once again mean rewriting every row after it.
 
 #### Where it lives
 
@@ -156,9 +176,9 @@ controller.
 
 Carrying the source valuation across is what keeps a transfer value-neutral.
 Moving stock between warehouses shouldn't create or destroy value. What that
-cost is depends on the item's valuation method — the average under Moving
-Average, the layers the draw reaches under FIFO and LIFO — but the neutrality
-holds either way. `test_transfer_carries_valuation_across` checks it directly,
+cost is depends on the item's valuation method: the average under Moving
+Average, the layers the draw reaches under FIFO and LIFO. The neutrality holds
+either way. `test_transfer_carries_valuation_across` checks it directly,
 `test_transfer_is_value_neutral_when_consolidated` checks it across the whole
 system, and `test_transfer_is_value_neutral_under_every_method` checks all three
 methods agree that value is conserved.
@@ -219,16 +239,21 @@ Filters are date range, item and warehouse.
 The TV rows show the moving average working. Ten arrive on 02-06 at KES 85,000,
 five more on 15-06 at KES 95,000, and the rate becomes KES 88,333.33, which is
 `(10 × 85,000 + 5 × 95,000) / 15`. The consumption on 01-07 changes the balance
-and leaves the rate alone, because only incoming rows count toward the average.
+and leaves the rate alone, because stock issued at the prevailing average
+doesn't disturb it.
 
-**Stock Balance** gives quantity, valuation rate and value as on a date, in one
-grouped query. Filters are as-on date, item, warehouse and consolidate.
+**Stock Balance** gives quantity, valuation rate and value as on a date.
+Quantities come from one grouped query; value is replayed from the movements,
+since no method reduces to an aggregate. Filters are as-on date, item, warehouse
+and consolidate.
 
 ![Stock Balance report](docs/screenshots/report-stock-balance.png)
 
 Ticking `Consolidate Warehouses` collapses it to one row per item. PB-ANKER-20K
 is the interesting one, since it's stocked in both Nairobi and Mombasa at
-different rates and blends to KES 2,556.25.
+different rates: 155 in Mombasa at KES 2,500 and 120 in Nairobi at KES 2,650,
+which is KES 705,500 over 275 units, so KES 2,565.45. The consolidated figure is
+the sum of what each warehouse holds, not an average taken across them.
 
 ![Stock Balance report, consolidated](docs/screenshots/report-stock-balance-consolidated.png)
 
@@ -258,14 +283,14 @@ section below.
 bench --site $YOUR_SITE run-tests --app warehouse_management
 ```
 
-96 tests, about 7 seconds. The brief asked for all non-report functionality to
+102 tests, about 10 seconds. The brief asked for all non-report functionality to
 be covered and said reports could have unit tests too, so both are in there:
 
 | Suite | Tests |
 |---|---|
 | Stock Entry | 26 |
 | Stock Ledger Entry | 13 |
-| Valuation | 27 |
+| Valuation | 33 |
 | Stock Balance report | 10 |
 | Stock Ledger report | 9 |
 | Warehouse | 6 |
@@ -273,7 +298,8 @@ be covered and said reports could have unit tests too, so both are in there:
 
 The valuation suite runs the same three movements under each method and asserts
 the three different answers, then repeats that through real Stock Entries, both
-reports, and transfers.
+reports, and transfers. `TestMatchesErpnextDefinition` replays the worked
+examples from the page the brief links to.
 
 `WarehouseTestCase` overrides `tearDown` so each test rolls back on its own.
 Frappe's `IntegrationTestCase` registers its rollback through `addClassCleanup`,
@@ -283,12 +309,6 @@ depending on what order they ran in.
 
 ### Known gaps
 
-- Consolidated Stock Balance re-averages incoming rows for Moving Average items,
-  so a transfer between two warehouses holding the same item at different costs
-  shifts the consolidated value even though nothing entered or left. Per-warehouse
-  figures are unaffected, and FIFO and LIFO don't have the problem because they
-  sum real layers. Fixing it properly needs the ledger to mark transfer-generated
-  incoming rows, since right now the row can't tell itself apart from a receipt.
 - `disabled` on Item and Warehouse is in the schema but nothing acts on it.
 - The `Stock Manager` and `Stock User` roles aren't created on install, so a
   fresh install only works for System Manager.

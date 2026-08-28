@@ -3,11 +3,11 @@
 
 """Stock Balance: quantity and value on a date.
 
-Quantities are derived from the ledger in a single grouped query, and so is
-value for items on Moving Average. FIFO and LIFO cannot be expressed as an
-aggregate -- which units you are still holding decides what they are worth --
-so those items get a second pass that replays their movements. The fast path is
-kept because most items sit on the default.
+Quantities come from the ledger in a single grouped query. Value does not:
+every method is path dependent, so the value of what is on hand is replayed
+from the movements themselves. Moving Average recalculates on acquisition
+against the value already held, and FIFO and LIFO track which layers are still
+there. None of the three reduces to an aggregate.
 
 Set the `consolidate` filter to collapse warehouses and report one row per item.
 """
@@ -93,8 +93,7 @@ def get_data(filters, consolidated=False):
 	group_by = "sle.item" if consolidated else "sle.item, sle.warehouse"
 	warehouse_select = "" if consolidated else "sle.warehouse,"
 
-	# One grouped query does the whole job: net balance, in/out quantities, and
-	# the weighted-average cost of everything received.
+	# One grouped query for the quantities; value is replayed below.
 	rows = frappe.db.sql(
 		f"""
 		SELECT
@@ -102,10 +101,7 @@ def get_data(filters, consolidated=False):
 			{warehouse_select}
 			SUM(sle.actual_qty) AS balance_qty,
 			SUM(CASE WHEN sle.actual_qty > 0 THEN sle.actual_qty ELSE 0 END) AS in_qty,
-			SUM(CASE WHEN sle.actual_qty < 0 THEN -sle.actual_qty ELSE 0 END) AS out_qty,
-			SUM(CASE WHEN sle.actual_qty > 0 THEN sle.actual_qty * sle.incoming_rate ELSE 0 END)
-				AS in_value,
-			SUM(CASE WHEN sle.actual_qty > 0 THEN sle.actual_qty ELSE 0 END) AS in_qty_for_rate
+			SUM(CASE WHEN sle.actual_qty < 0 THEN -sle.actual_qty ELSE 0 END) AS out_qty
 		FROM `tabStock Ledger Entry` sle
 		WHERE {condition_sql}
 		GROUP BY {group_by}
@@ -120,29 +116,18 @@ def get_data(filters, consolidated=False):
 		if row.item not in methods:
 			methods[row.item] = get_item_valuation_method(row.item)
 
-	layered = [item for item, method in methods.items() if method != MOVING_AVERAGE]
-	layered_values = get_layered_values(filters, layered, methods, consolidated)
+	values_by_key = get_replayed_values(filters, methods, consolidated)
 
 	data = []
 	for row in rows:
 		balance_qty = flt(row.balance_qty)
-
-		if methods[row.item] == MOVING_AVERAGE:
-			valuation_rate = (
-				flt(row.in_value) / flt(row.in_qty_for_rate) if flt(row.in_qty_for_rate) else 0.0
-			)
-			balance_value = balance_qty * valuation_rate
-		else:
-			# Value comes from the layers still on hand; the rate is what that
-			# implies per unit rather than something averaged separately.
-			key = row.item if consolidated else (row.item, row.warehouse)
-			balance_value = flt(layered_values.get(key, 0.0))
-			valuation_rate = (balance_value / balance_qty) if balance_qty else 0.0
+		key = row.item if consolidated else (row.item, row.warehouse)
+		balance_value = flt(values_by_key.get(key, 0.0))
 
 		entry = {
 			"item": row.item,
 			"balance_qty": balance_qty,
-			"valuation_rate": valuation_rate,
+			"valuation_rate": (balance_value / balance_qty) if balance_qty else 0.0,
 			"balance_value": balance_value,
 			"in_qty": flt(row.in_qty),
 			"out_qty": flt(row.out_qty),
@@ -155,23 +140,24 @@ def get_data(filters, consolidated=False):
 	return data
 
 
-def get_layered_values(filters, items, methods, consolidated=False) -> dict:
-	"""Stock value for FIFO/LIFO items, replayed from their movements.
+def get_replayed_values(filters, methods, consolidated=False) -> dict:
+	"""Stock value per group, replayed from the movements.
 
-	Layers live in a warehouse, so valuation is always computed per warehouse.
-	Consolidation then sums those values instead of re-averaging the incoming
-	rows, which is what keeps a transfer between warehouses value neutral: the
-	receiving row is priced at what left the source, so the two cancel.
+	Valuation is always computed per warehouse, because both the average and the
+	layers belong to a warehouse. Consolidation then sums those values rather
+	than re-deriving one figure across warehouses, which is what keeps a transfer
+	between two warehouses value neutral even when they hold the same item at
+	different costs.
 	"""
-	if not items:
+	if not methods:
 		return {}
 
-	conditions = [
-		"sle.is_cancelled = 0",
-		"sle.posting_datetime <= %(to_date)s",
-		"sle.item IN %(items)s",
-	]
-	values = {"to_date": f"{filters.to_date} 23:59:59", "items": tuple(items)}
+	conditions = ["sle.is_cancelled = 0", "sle.posting_datetime <= %(to_date)s"]
+	values = {"to_date": f"{filters.to_date} 23:59:59"}
+
+	if filters.get("item"):
+		conditions.append("sle.item = %(item)s")
+		values["item"] = filters.item
 
 	if filters.get("warehouse"):
 		conditions.append("sle.warehouse = %(warehouse)s")
@@ -191,7 +177,9 @@ def get_layered_values(filters, items, methods, consolidated=False) -> dict:
 	states = {}
 	for row in rows:
 		key = (row.item, row.warehouse)
-		state = states.setdefault(key, ValuationState(methods[row.item]))
+		state = states.setdefault(
+			key, ValuationState(methods.get(row.item, MOVING_AVERAGE))
+		)
 		state.add(row.actual_qty, row.incoming_rate)
 
 	totals = {}

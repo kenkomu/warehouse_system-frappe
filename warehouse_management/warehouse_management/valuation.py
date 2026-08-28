@@ -9,9 +9,15 @@ end. `ValuationState` is that replay, and it is the only implementation of
 valuation in the app -- the reports, the transfer pricing and the point-in-time
 helpers all drive this same class.
 
-Moving Average keeps two running totals and needs no history. FIFO and LIFO keep
+Moving Average keeps one running value, recalculated whenever stock is acquired
+and drawn down at the prevailing average when stock leaves. FIFO and LIFO keep
 the cost layers still on hand, because which units you are holding decides what
 they are worth.
+
+All three are path dependent, so none of them is a single aggregate query. That
+is the price of the stateless ledger: ERPNext gets a one-query read because it
+stores the rate on every row, and storing it is exactly what this app does not
+do.
 """
 
 import frappe
@@ -52,9 +58,8 @@ class ValuationState:
 		# Signed running balance, authoritative for qty regardless of method.
 		self.qty = 0.0
 
-		# Moving Average: weighted totals over incoming rows only.
-		self.in_qty = 0.0
-		self.in_value = 0.0
+		# Moving Average: the running value of the stock on hand.
+		self.average_value = 0.0
 
 		# FIFO / LIFO: cost layers still on hand, oldest first, as [qty, rate].
 		self.layers: list[list[float]] = []
@@ -65,14 +70,30 @@ class ValuationState:
 		actual_qty = flt(actual_qty)
 		incoming_rate = flt(incoming_rate)
 
+		if self.method == MOVING_AVERAGE:
+			# Recalculated on acquisition against the value already on hand, and
+			# reduced at the prevailing average on issue. Reading the rate before
+			# moving the quantity is what makes the issue leave at the old average
+			# rather than one it helped create.
+			if actual_qty > 0:
+				self.average_value += actual_qty * incoming_rate
+			else:
+				self.average_value += actual_qty * self.rate
+
+			self.qty += actual_qty
+
+			if self.qty <= 0:
+				# Nothing on hand carries no value, and this keeps float residue
+				# from a full issue out of the next receipt's average.
+				self.average_value = 0.0
+
+			return
+
 		self.qty += actual_qty
 
 		if actual_qty > 0:
-			self.in_qty += actual_qty
-			self.in_value += actual_qty * incoming_rate
-			if self.method in (FIFO, LIFO):
-				self.layers.append([actual_qty, incoming_rate])
-		elif actual_qty < 0 and self.method in (FIFO, LIFO):
+			self.layers.append([actual_qty, incoming_rate])
+		elif actual_qty < 0:
 			self._consume(-actual_qty)
 
 	def _consume(self, qty: float) -> float:
@@ -106,7 +127,7 @@ class ValuationState:
 	def value(self) -> float:
 		"""Value of the stock on hand."""
 		if self.method == MOVING_AVERAGE:
-			return self.qty * self.rate
+			return self.average_value
 
 		return sum(layer[0] * layer[1] for layer in self.layers)
 
@@ -114,7 +135,7 @@ class ValuationState:
 	def rate(self) -> float:
 		"""Cost per unit of the stock on hand."""
 		if self.method == MOVING_AVERAGE:
-			return (self.in_value / self.in_qty) if self.in_qty else 0.0
+			return (self.average_value / self.qty) if self.qty else 0.0
 
 		layer_qty = sum(layer[0] for layer in self.layers)
 		if not layer_qty:

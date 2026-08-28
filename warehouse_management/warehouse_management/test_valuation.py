@@ -347,24 +347,26 @@ class TestReportsRespectValuationMethod(WarehouseTestCase):
 		self.assertEqual(rows[0]["valuation_rate"], 200)
 
 	def test_consolidated_transfer_is_value_neutral_across_mixed_rates(self):
-		"""The case the Moving Average consolidation gets wrong.
+		"""Two warehouses holding one item at different costs, then a transfer.
 
-		Two warehouses holding the same item at different costs, then a transfer
-		between them. Summing real layers keeps the total; re-averaging the
-		incoming rows would not.
+		Consolidation sums what each warehouse actually holds. Deriving a single
+		figure from the incoming rows instead would count the receiving side of
+		the transfer as though it were a purchase, and the total would move even
+		though nothing entered or left.
 		"""
-		item = create_item("VR-MIXED", valuation_method=FIFO)
-		receipt(item, self.wh_a, qty=200, rate=2500, posting_date="2026-02-01")
-		receipt(item, self.wh_b, qty=120, rate=2650, posting_date="2026-02-02")
+		for method in (MOVING_AVERAGE, FIFO, LIFO):
+			item = create_item(f"VR-MIXED-{method[:4]}", valuation_method=method)
+			receipt(item, self.wh_a, qty=200, rate=2500, posting_date="2026-02-01")
+			receipt(item, self.wh_b, qty=120, rate=2650, posting_date="2026-02-02")
 
-		filters = {"to_date": "2026-12-31", "item": item, "consolidate": 1}
-		_columns, before = stock_balance(filters)
+			filters = {"to_date": "2026-12-31", "item": item, "consolidate": 1}
+			_columns, before = stock_balance(filters)
 
-		transfer(item, self.wh_a, self.wh_b, qty=100, posting_date="2026-03-01")
-		_columns, after = stock_balance(filters)
+			transfer(item, self.wh_a, self.wh_b, qty=100, posting_date="2026-03-01")
+			_columns, after = stock_balance(filters)
 
-		self.assertEqual(before[0]["balance_value"], 818000)
-		self.assertEqual(after[0]["balance_value"], 818000)
+			self.assertEqual(before[0]["balance_value"], 818000, msg=method)
+			self.assertEqual(after[0]["balance_value"], 818000, msg=method)
 
 	def test_stock_ledger_running_valuation_follows_the_method(self):
 		expected = {MOVING_AVERAGE: 175, FIFO: 200, LIFO: 150}
@@ -379,3 +381,92 @@ class TestReportsRespectValuationMethod(WarehouseTestCase):
 			self.assertEqual(rows[0].valuation_rate, 100, msg=method)
 			self.assertEqual(rows[-1].valuation_rate, rate, msg=method)
 			self.assertEqual(rows[-1].balance_qty, 20, msg=method)
+
+
+class TestMatchesErpnextDefinition(WarehouseTestCase):
+	"""The worked examples from the page the brief links to.
+
+	https://docs.frappe.io/erpnext/calculation-of-valuation-rate-in-fifo-and-moving-average
+
+	Buy 10 @ 100, buy 20 @ 120, then sell 15. FIFO takes the 10 @ 100 and 5 of
+	the 120s, so the sale costs 1,600 and 15 @ 120 are left. Moving Average
+	blends to 113.33, so the sale costs 1,700 and 1,700 is left. Both agree the
+	stock was worth 3,400 in total.
+	"""
+
+	def setUp(self):
+		self.warehouse = create_warehouse("EN Store")
+
+	def stock_up(self, method, code):
+		item = create_item(code, valuation_method=method)
+		receipt(item, self.warehouse, qty=10, rate=100, posting_date="2020-04-01")
+		receipt(item, self.warehouse, qty=20, rate=120, posting_date="2020-04-06")
+		return item
+
+	def test_fifo_worked_example(self):
+		item = self.stock_up(FIFO, "EN-FIFO")
+
+		cost = get_outgoing_rate(item, self.warehouse, 15, "2020-04-10 00:00:00") * 15
+		consume(item, self.warehouse, qty=15, posting_date="2020-04-10")
+
+		self.assertEqual(cost, 1600)
+		self.assertEqual(get_valuation_rate(item, self.warehouse), 120)
+		self.assertEqual(get_stock_value(item, self.warehouse), 1800)
+
+	def test_moving_average_worked_example(self):
+		item = self.stock_up(MOVING_AVERAGE, "EN-AVG")
+
+		cost = get_outgoing_rate(item, self.warehouse, 15, "2020-04-10 00:00:00") * 15
+		consume(item, self.warehouse, qty=15, posting_date="2020-04-10")
+
+		self.assertAlmostEqual(cost, 1700, places=2)
+		self.assertAlmostEqual(get_valuation_rate(item, self.warehouse), 113.33, places=2)
+		self.assertAlmostEqual(get_stock_value(item, self.warehouse), 1700, places=2)
+
+	def test_both_methods_account_for_the_same_total(self):
+		fifo = self.stock_up(FIFO, "EN-TOTAL-FIFO")
+		average = self.stock_up(MOVING_AVERAGE, "EN-TOTAL-AVG")
+
+		for item in (fifo, average):
+			consume(item, self.warehouse, qty=15, posting_date="2020-04-10")
+
+		# 1,600 + 1,800 under FIFO, 1,700 + 1,700 under Moving Average.
+		self.assertAlmostEqual(get_stock_value(fifo, self.warehouse) + 1600, 3400)
+		self.assertAlmostEqual(get_stock_value(average, self.warehouse) + 1700, 3400, places=2)
+
+	def test_average_is_taken_against_stock_on_hand_not_all_receipts(self):
+		"""The distinction that makes this a *moving* average.
+
+		Averaging every incoming row ever posted would keep the cost of stock
+		that has already gone. Selling out and rebuying must leave the new price
+		standing on its own.
+		"""
+		item = create_item("EN-RESET", valuation_method=MOVING_AVERAGE)
+		receipt(item, self.warehouse, qty=10, rate=100, posting_date="2020-01-01")
+		consume(item, self.warehouse, qty=10, posting_date="2020-02-01")
+		receipt(item, self.warehouse, qty=10, rate=200, posting_date="2020-03-01")
+
+		# Averaging all receipts would say 150. The stock on hand cost 200.
+		self.assertEqual(get_valuation_rate(item, self.warehouse), 200)
+		self.assertEqual(get_stock_value(item, self.warehouse), 2000)
+
+	def test_partial_issue_before_a_repricing_receipt(self):
+		item = create_item("EN-PARTIAL", valuation_method=MOVING_AVERAGE)
+		receipt(item, self.warehouse, qty=10, rate=100, posting_date="2020-01-01")
+		consume(item, self.warehouse, qty=5, posting_date="2020-02-01")
+		receipt(item, self.warehouse, qty=10, rate=200, posting_date="2020-03-01")
+
+		# 5 still on hand at 100, plus 10 at 200, is 2,500 over 15 units.
+		self.assertAlmostEqual(get_valuation_rate(item, self.warehouse), 2500 / 15)
+		self.assertEqual(get_stock_value(item, self.warehouse), 2500)
+
+	def test_issuing_stock_leaves_the_average_untouched(self):
+		item = create_item("EN-ISSUE", valuation_method=MOVING_AVERAGE)
+		receipt(item, self.warehouse, qty=10, rate=100, posting_date="2020-01-01")
+		receipt(item, self.warehouse, qty=30, rate=200, posting_date="2020-01-02")
+
+		before = get_valuation_rate(item, self.warehouse)
+		consume(item, self.warehouse, qty=35, posting_date="2020-01-03")
+
+		self.assertEqual(before, 175)
+		self.assertEqual(get_valuation_rate(item, self.warehouse), 175)

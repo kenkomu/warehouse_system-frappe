@@ -61,39 +61,20 @@ def get_stock_balance(item: str, warehouse: str, upto: str | None = None) -> flo
 def get_moving_average_rate(item: str, warehouse: str, upto: str | None = None) -> float:
 	"""Moving average valuation rate for an item/warehouse as of a datetime.
 
-	The weighted average cost of everything received so far:
+	The rate is recalculated whenever stock is acquired, against the value already
+	on hand rather than against every receipt ever posted:
 
-	    rate = SUM(actual_qty * incoming_rate) / SUM(actual_qty)   over incoming rows
+	    rate = value of stock on hand / quantity on hand
 
-	This is the whole calculation, in one query -- no running state to maintain and
-	nothing to rewrite when an entry is posted out of order.
+	so a receipt blends into what is there now, and an issue leaves at the
+	prevailing average without disturbing it. Averaging over all incoming rows
+	instead would keep the cost of stock that has already gone.
+
+	That makes it path dependent, so it is a replay rather than one aggregate
+	query. ERPNext reads it in a single query because it stores the rate on every
+	ledger row; this ledger stores nothing, which is the trade.
 	"""
-	values = {"item": item, "warehouse": warehouse}
-	upto_clause = ""
-	if upto:
-		upto_clause = "AND posting_datetime <= %(upto)s"
-		values["upto"] = upto
-
-	row = frappe.db.sql(
-		f"""
-		SELECT
-			CASE
-				WHEN SUM(actual_qty) > 0
-				THEN SUM(actual_qty * incoming_rate) / SUM(actual_qty)
-				ELSE 0
-			END AS valuation_rate
-		FROM `tabStock Ledger Entry`
-		WHERE item = %(item)s
-			AND warehouse = %(warehouse)s
-			AND is_cancelled = 0
-			AND actual_qty > 0
-			{upto_clause}
-		""",
-		values,
-		as_dict=True,
-	)
-
-	return flt(row[0].valuation_rate) if row else 0.0
+	return flt(replay(get_ledger_rows(item, warehouse, upto), MOVING_AVERAGE).rate)
 
 
 def get_first_negative_balance(
@@ -189,14 +170,8 @@ def get_ledger_rows(item: str, warehouse: str, upto: str | None = None) -> list[
 def get_valuation_rate(
 	item: str, warehouse: str, upto: str | None = None, method: str | None = None
 ) -> float:
-	"""Cost per unit of the stock on hand, under the item's configured method.
-
-	Moving Average keeps its single-query path; the layered methods replay.
-	"""
+	"""Cost per unit of the stock on hand, under the item's configured method."""
 	method = method or get_item_valuation_method(item)
-
-	if method == MOVING_AVERAGE:
-		return get_moving_average_rate(item, warehouse, upto)
 
 	return flt(replay(get_ledger_rows(item, warehouse, upto), method).rate)
 
@@ -206,15 +181,12 @@ def get_outgoing_rate(
 ) -> float:
 	"""Cost per unit of removing qty from a warehouse.
 
-	This is not the same question as `get_valuation_rate`. Under Moving Average
-	it is, because every unit leaves at the average. Under FIFO and LIFO the cost
-	of what leaves is decided by the layers the draw reaches, which is generally
-	not the rate of what stays behind.
+	This is not the same question as `get_valuation_rate`. Under Moving Average it
+	is, because every unit leaves at the average. Under FIFO and LIFO the cost of
+	what leaves is decided by the layers the draw reaches, which is generally not
+	the rate of what stays behind.
 	"""
 	method = method or get_item_valuation_method(item)
-
-	if method == MOVING_AVERAGE:
-		return get_moving_average_rate(item, warehouse, upto)
 
 	state = replay(get_ledger_rows(item, warehouse, upto), method)
 	return flt(state.outgoing_rate(qty))
@@ -223,11 +195,6 @@ def get_outgoing_rate(
 def get_stock_value(item: str, warehouse: str, upto: str | None = None) -> float:
 	"""Value of the stock on hand, under the item's configured method."""
 	method = get_item_valuation_method(item)
-
-	if method == MOVING_AVERAGE:
-		return flt(get_stock_balance(item, warehouse, upto)) * flt(
-			get_moving_average_rate(item, warehouse, upto)
-		)
 
 	return flt(replay(get_ledger_rows(item, warehouse, upto), method).value)
 
